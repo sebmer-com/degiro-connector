@@ -6,9 +6,10 @@ Complete API for searching products and placing orders with full DEGIRO function
 
 import json
 import os
+import re
 from typing import Optional, List, Dict, Any
 from datetime import datetime
-import pytz
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, HTTPException, Depends, status, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -91,6 +92,7 @@ class LeveragedProduct(BaseModel):
     tradable: bool
     expiration_date: Optional[str] = None
     issuer: Optional[str] = None
+    price_source: Optional[str] = None
 
 # NEW API MODELS
 
@@ -273,56 +275,112 @@ def verify_api_key_header_only(
 
 # Global API instance - reused within single server lifetime
 trading_api = None
+price_cache: dict[str, dict[str, Any]] = {}
 
-def get_trading_api():
-    """Get or create DEGIRO trading API connection"""
+def _build_degiro_credentials() -> Credentials:
+    # Build DEGIRO credentials from env, falling back to config.json.
+    username = os.getenv('DEGIRO_USERNAME')
+    password = os.getenv('DEGIRO_PASSWORD')
+    totp_secret_key = os.getenv('DEGIRO_TOTP_SECRET')
+    int_account = os.getenv('DEGIRO_INT_ACCOUNT')
+
+    if all([username, password, totp_secret_key]):
+        credentials_data = {
+            'username': username,
+            'password': password,
+            'totp_secret_key': totp_secret_key,
+        }
+        if int_account:
+            credentials_data['int_account'] = int(int_account)
+        return Credentials(**credentials_data)
+
+    try:
+        with open(DEGIRO_CONFIG_PATH, 'r') as f:
+            config = json.load(f)
+        return Credentials(
+            username=config['username'],
+            password=config['password'],
+            totp_secret_key=config['totp_secret_key'],
+            int_account=config['int_account'],
+        )
+    except FileNotFoundError:
+        raise Exception('DEGIRO credentials not found in environment variables or config file')
+
+
+def get_trading_api(force_reconnect: bool = False):
+    # Get or create DEGIRO trading API connection.
     global trading_api
+
+    if force_reconnect:
+        trading_api = None
 
     if trading_api is None:
         try:
-            # Try environment variables first (secure)
-            username = os.getenv('DEGIRO_USERNAME')
-            password = os.getenv('DEGIRO_PASSWORD')
-            totp_secret_key = os.getenv('DEGIRO_TOTP_SECRET')
-            int_account = os.getenv('DEGIRO_INT_ACCOUNT')
-            
-            # Create credentials with pydantic syntax
-            credentials_data = {
-                'username': username,
-                'password': password,
-                'totp_secret_key': totp_secret_key
-            }
-            
-            if int_account:
-                credentials_data['int_account'] = int(int_account)
-                
-            credentials = Credentials(**credentials_data)
-            
-            # Fallback to config file if env vars not set
-            if not all([username, password, totp_secret_key]):
-                try:
-                    with open(DEGIRO_CONFIG_PATH, 'r') as f:
-                        config = json.load(f)
-                    
-                    credentials = Credentials(
-                        username=config['username'],
-                        password=config['password'],
-                        totp_secret_key=config['totp_secret_key'],
-                        int_account=config['int_account']
-                    )
-                except FileNotFoundError:
-                    raise Exception("DEGIRO credentials not found in environment variables or config file")
-            
-            trading_api = TradingAPI(credentials=credentials)
+            trading_api = TradingAPI(credentials=_build_degiro_credentials())
             trading_api.connect()
-
         except Exception as e:
+            trading_api = None
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Failed to connect to DEGIRO: {str(e)}"
+                detail=f'Failed to connect to DEGIRO: {str(e)}'
             )
 
     return trading_api
+
+
+def reset_trading_api():
+    # Drop the cached DEGIRO session so the next call logs in again.
+    global trading_api
+    trading_api = None
+
+
+def ping_trading_api(api: TradingAPI) -> bool:
+    # Cheap authenticated call used to verify the cached DEGIRO session.
+    req = StocksRequest(
+        search_text='AAPL',
+        offset=0,
+        limit=1,
+        require_total=False,
+        sort_columns='name',
+        sort_types='asc',
+    )
+    res = api.product_search(req, raw=True)
+    products = (res or {}).get('products') if isinstance(res, dict) else None
+    return bool(products)
+
+
+def get_fresh_trading_api():
+    # Return a usable DEGIRO session, reconnecting once if the cached one expired.
+    api = get_trading_api()
+    try:
+        if ping_trading_api(api):
+            return api
+    except Exception as e:
+        if not is_session_expired(str(e)):
+            raise
+
+    reset_trading_api()
+    api = get_trading_api(force_reconnect=True)
+    if not ping_trading_api(api):
+        reset_trading_api()
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail='DEGIRO session invalid after reconnect'
+        )
+    return api
+
+
+def call_degiro_with_reconnect(operation):
+    # Run a DEGIRO operation and retry once after dropping an expired session.
+    api = get_trading_api()
+    try:
+        return operation(api)
+    except Exception as e:
+        if not is_session_expired(str(e)):
+            raise
+        reset_trading_api()
+        api = get_trading_api(force_reconnect=True)
+        return operation(api)
 
 # === DYNAMIC LEVERAGED SEARCH ===
 
@@ -600,7 +658,7 @@ def get_real_prices_batch(product_ids: list[str]) -> dict[str, PriceInfo]:
             )
 
         # Get trading API instance to fetch product metadata
-        api = get_trading_api()
+        api = get_fresh_trading_api()
         
         # Get product info for all products to determine vwdIds
         try:
@@ -740,6 +798,11 @@ def get_real_prices_batch(product_ids: list[str]) -> dict[str, PriceInfo]:
                 last=round(last, 2) if last is not None else None,
             )
 
+        if results:
+            cache_time = datetime.now().isoformat()
+            for cache_product_id, cache_price in results.items():
+                price_cache[str(cache_product_id)] = {"price": cache_price, "timestamp": cache_time}
+
         print(f"✅ Successfully got prices for {len(results)} products")
         return results
         
@@ -755,7 +818,7 @@ def get_real_price(product_id: str) -> PriceInfo:
     """Get real price data from DEGIRO using quotecast API"""
     try:
         # First get user token from trading API session
-        api = get_trading_api()
+        api = get_fresh_trading_api()
         
         # Get product info to determine the correct vwdId for quotecast
         product_info = api.get_products_info(
@@ -944,7 +1007,6 @@ def get_volume_data(symbol: str, degiro_id: str, vwd_id: str, _retry_depth: int 
         from degiro_connector.quotecast.models.ticker import TickerRequest
         from degiro_connector.quotecast.tools.ticker_fetcher import TickerFetcher
         from degiro_connector.quotecast.tools.ticker_to_df import TickerToDF
-        import pytz
         
         # Use the existing trading API session to get user token
         api = get_trading_api()  # This ensures we have an active session
@@ -1039,7 +1101,7 @@ def get_volume_data(symbol: str, degiro_id: str, vwd_id: str, _retry_depth: int 
             raise HTTPException(status_code=503, detail=f"Failed to parse volume data for {symbol}: {str(e)}")
         
         # Calculate time-based metrics (simplified - always return current daily data)
-        et_now = datetime.now(pytz.timezone('US/Eastern'))
+        et_now = datetime.now(ZoneInfo('America/New_York'))
         market_open = et_now.replace(hour=9, minute=30, second=0, microsecond=0)
         
         # Calculate elapsed minutes from market open
@@ -1094,7 +1156,8 @@ def get_volume_data(symbol: str, degiro_id: str, vwd_id: str, _retry_depth: int 
 
 def filter_by_product_subtype(products: list, subtype: str) -> list:
     """Filter leveraged products by subtype"""
-    if subtype == "ALL":
+    normalized_subtype = str(subtype or "ALL").strip().upper().replace("-", "_")
+    if normalized_subtype == "ALL":
         return products
     
     filtered_products = []
@@ -1102,22 +1165,116 @@ def filter_by_product_subtype(products: list, subtype: str) -> list:
     for product in products:
         name = product.get('name', '').lower()
         
-        if subtype == "CALL_PUT":
+        if normalized_subtype == "CALL_PUT":
             # Optionsscheine: Traditional Call/Put options with STR (Strike) pattern
             if ('call str' in name or 'put str' in name) and 'mini' not in name and 'unlimited' not in name:
                 filtered_products.append(product)
         
-        elif subtype == "MINI":
+        elif normalized_subtype == "MINI":
             # Knockouts: Mini Long/Short products with Stop Loss
             if 'mini long' in name or 'mini short' in name:
                 filtered_products.append(product)
         
-        elif subtype == "UNLIMITED":
+        elif normalized_subtype == "UNLIMITED":
             # Faktor: Unlimited Long/Short products (factor certificates)
             if 'unlimited long' in name or 'unlimited short' in name:
                 filtered_products.append(product)
     
     return filtered_products
+
+
+LONG_KNOCKOUT_NAME_RE = re.compile(r"\b(?:LONG|CALL)\b", re.IGNORECASE)
+KO_STYLE_NAME_RE = re.compile(r"\b(?:TURBO|MINI|KNOCK[- ]?OUT|OPEN[- ]?END|UNLIMITED|FAKTOR|FACTOR|BEST)\b", re.IGNORECASE)
+REJECTED_LEVERAGED_NAME_RE = re.compile(r"\b(?:SHORT|PUT|OPTIONSSCHEIN(?:E)?|OPTIONS?SCHEIN(?:E)?)\b", re.IGNORECASE)
+
+
+def is_supported_knockout_product(product: Dict[str, Any], *, action: str) -> bool:
+    """Return true for tradable DEGIRO KO/turbo/open-end products only."""
+    if not product.get("tradable", False):
+        return False
+
+    target_direction = "L" if str(action).upper() == "LONG" else "S"
+    shortlong = normalize_shortlong(product.get("shortlong"))
+    if shortlong and shortlong != target_direction:
+        return False
+
+    name = str(product.get("name") or "")
+    if not name or REJECTED_LEVERAGED_NAME_RE.search(name):
+        return False
+    if str(action).upper() == "LONG" and not LONG_KNOCKOUT_NAME_RE.search(name):
+        return False
+    return bool(KO_STYLE_NAME_RE.search(name))
+
+
+def normalize_shortlong(value: Any) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip().upper()
+    if text in {"1", "L", "LONG", "BUY"}:
+        return "L"
+    if text in {"0", "S", "SHORT", "SELL"}:
+        return "S"
+    return text
+
+
+def product_fallback_price(product: Dict[str, Any]) -> tuple[PriceInfo, str]:
+    """Best-effort price from DEGIRO product-search metadata.
+
+    Quotecast often returns no ticks outside market hours. Product search still
+    carries usable indicative/close fields for many certificates, which is good
+    enough for discovery and dry-run order sizing.
+    """
+    direct_fields = (
+        ("ask", "ask"),
+        ("askPrice", "ask"),
+        ("bid", "bid"),
+        ("bidPrice", "bid"),
+        ("last", "last"),
+        ("lastPrice", "last"),
+        ("price", "last"),
+        ("closePrice", "last"),
+        ("close", "last"),
+        ("previousClose", "last"),
+        ("indicativePrice", "last"),
+    )
+    values: dict[str, float] = {}
+    source = ""
+    for field, target in direct_fields:
+        price = _positive_float(product.get(field))
+        if price is None:
+            continue
+        values.setdefault(target, price)
+        source = source or field
+
+    for container_key in ("currentPrice", "current_price", "quote", "priceInfo"):
+        nested = product.get(container_key)
+        if not isinstance(nested, dict):
+            continue
+        for field, target in direct_fields:
+            price = _positive_float(nested.get(field))
+            if price is None:
+                continue
+            values.setdefault(target, price)
+            source = source or f"{container_key}.{field}"
+
+    price = PriceInfo(
+        bid=round(values["bid"], 2) if "bid" in values else None,
+        ask=round(values["ask"], 2) if "ask" in values else None,
+        last=round(values["last"], 2) if "last" in values else None,
+    )
+    return price, source
+
+
+def _positive_float(value: Any) -> Optional[float]:
+    try:
+        if value is None:
+            return None
+        parsed = float(str(value).replace(",", "."))
+    except Exception:
+        return None
+    if parsed <= 0 or parsed != parsed or parsed in {float("inf"), float("-inf")}:
+        return None
+    return parsed
 
 def create_degiro_order(request: OrderRequest) -> Order:
     """Create DEGIRO Order object from request"""
@@ -1261,7 +1418,7 @@ async def search_stocks(
             detail="Query parameter 'q' is required"
         )
     
-    api = get_trading_api()
+    api = get_fresh_trading_api()
     
     # Search for all matching stocks
     stock_products = search_stocks_multiple(api, request.q.strip(), request.limit)
@@ -1316,7 +1473,7 @@ async def search_leveraged_products(
     Returns leveraged products for the specified underlying stock.
     """
     
-    api = get_trading_api()
+    api = get_fresh_trading_api()
     
     try:
         # Get the underlying stock info first
@@ -1402,9 +1559,8 @@ async def search_leveraged_products(
 
         print(f"DEBUG: Fetched {len(all_products)} total products from DEGIRO")
 
-        leveraged_products_data = []
-        if all_products:
-            products = all_products
+        def filter_leveraged_products(products: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            filtered: List[Dict[str, Any]] = []
 
             # Map action to DEGIRO direction value
             target_direction = "L" if request.action.upper() == "LONG" else "S"
@@ -1431,25 +1587,65 @@ async def search_leveraged_products(
 
             for product in products:
                 # Use DEGIRO's native fields (more reliable than name parsing)
-                leverage = product.get('leverage', 0)
-                shortlong = product.get('shortlong')  # DEGIRO direction field
-                tradable = product.get('tradable', False)
+                leverage = _positive_float(product.get('leverage')) or 0.0
 
-                # Filter by leverage range, direction, and tradability
+                # Filter by leverage range, direction, tradability, and KO-style product names.
                 if (request.min_leverage <= leverage <= request.max_leverage and
-                    shortlong == target_direction and
-                    tradable):
-                    leveraged_products_data.append(product)
-                    if len(leveraged_products_data) <= 3:
-                        print(f"DEBUG: Added product {len(leveraged_products_data)}: {product.get('name')}, leverage={leverage}, ID={product.get('id')}")
+                    is_supported_knockout_product(product, action=request.action)):
+                    filtered.append(product)
+                    if len(filtered) <= 3:
+                        print(f"DEBUG: Added product {len(filtered)}: {product.get('name')}, leverage={leverage}, ID={product.get('id')}")
 
-                if len(leveraged_products_data) >= request.limit:
+                if len(filtered) >= request.limit:
                     break
+            return filtered
 
-            print(f"DEBUG: After filtering: {len(leveraged_products_data)} products (min_lev={request.min_leverage}, max_lev={request.max_leverage})")
+        leveraged_products_data = filter_leveraged_products(all_products) if all_products else []
+
+        if not leveraged_products_data and search_term:
+            print(f"DEBUG: No eligible products by underlying_id; retrying leveraged search with text '{search_term}'")
+            fallback_products: List[Dict[str, Any]] = []
+            seen_product_ids = {str(product.get("id")) for product in all_products if product.get("id")}
+            offset = 0
+            total_products = None
+            while True:
+                leveraged_request = LeveragedsRequest(
+                    popular_only=False,
+                    input_aggregate_types="",
+                    input_aggregate_values="",
+                    search_text=search_term,
+                    offset=offset,
+                    limit=batch_size,
+                    require_total=True,
+                    sort_columns="leverage",
+                    sort_types="asc",
+                    shortlong=shortlong_value
+                )
+                search_results = api.product_search(leveraged_request, raw=True)
+                if offset == 0 and isinstance(search_results, dict):
+                    total_products = search_results.get('total', 0)
+                    print(f"DEBUG: Text fallback total products available: {total_products}")
+                if not isinstance(search_results, dict) or 'products' not in search_results:
+                    break
+                products = search_results['products']
+                if not products:
+                    break
+                for product in products:
+                    product_id = str(product.get("id") or "")
+                    if product_id and product_id in seen_product_ids:
+                        continue
+                    if product_id:
+                        seen_product_ids.add(product_id)
+                    fallback_products.append(product)
+                offset += batch_size
+                if total_products and offset >= total_products:
+                    break
+            leveraged_products_data = filter_leveraged_products(fallback_products)
+
+        print(f"DEBUG: After filtering: {len(leveraged_products_data)} products (min_lev={request.min_leverage}, max_lev={request.max_leverage})")
         
         # Filter by product subtype if specified
-        if hasattr(request, 'product_subtype') and request.product_subtype != "ALL":
+        if hasattr(request, 'product_subtype') and str(request.product_subtype or "ALL").strip().upper() != "ALL":
             leveraged_products_data = filter_by_product_subtype(leveraged_products_data, request.product_subtype)
         
         # Get underlying stock info for response
@@ -1490,27 +1686,51 @@ async def search_leveraged_products(
 
         print(f"DEBUG: Got real prices for {len(real_prices)} / {len(product_ids)} leveraged products")
 
-        # Convert to response format - ONLY include products with real pricing
+        product_metadata: Dict[str, Dict[str, Any]] = {}
+        missing_price_ids = [product_id for product_id in product_ids if product_id not in real_prices]
+        if missing_price_ids:
+            try:
+                info = api.get_products_info(product_list=[int(pid) for pid in missing_price_ids], raw=True)
+                if isinstance(info, dict) and isinstance(info.get("data"), dict):
+                    product_metadata = {str(pid): data for pid, data in info["data"].items() if isinstance(data, dict)}
+            except Exception as e:
+                print(f"DEBUG: Product metadata fallback fetch failed: {e}")
+
+        # Convert to response format. Realtime quotecast is best-effort; after
+        # hours, keep valid products if product-search/product-info metadata
+        # exposes a usable indicative or close price.
         leveraged_products = []
         for product in leveraged_products_data:
             product_id = str(product.get('id', ''))
+            price_source = "quotecast"
+            current_price = real_prices.get(product_id)
+            if current_price is None:
+                current_price, price_source = product_fallback_price(product)
+            if current_price.last is None and current_price.bid is None and current_price.ask is None:
+                current_price, price_source = product_fallback_price(product_metadata.get(product_id, {}))
+                if price_source:
+                    price_source = f"metadata.{price_source}"
+            if current_price.last is None and current_price.bid is None and current_price.ask is None:
+                continue
 
-            # Only include products that have real pricing data
-            if product_id in real_prices:
-                leveraged_product = LeveragedProduct(
-                    product_id=product_id,
-                    name=product.get('name', ''),
-                    isin=product.get('isin', ''),
-                    leverage=product.get('leverage', 0.0),
-                    direction="LONG" if product.get('shortlong') == "L" else "SHORT",
-                    currency=product.get('currency', 'EUR'),
-                    exchange_id=str(product.get('exchangeId', '')),
-                    current_price=real_prices[product_id],
-                    tradable=product.get('tradable', False),
-                    expiration_date=product.get('expirationDate'),
-                    issuer=extract_issuer(product.get('name', ''))
-                )
-                leveraged_products.append(leveraged_product)
+            if price_source != "quotecast":
+                price_cache[product_id] = {"price": current_price, "timestamp": datetime.now().isoformat()}
+
+            leveraged_product = LeveragedProduct(
+                product_id=product_id,
+                name=product.get('name', ''),
+                isin=product.get('isin', ''),
+                leverage=product.get('leverage', 0.0),
+                direction="LONG" if normalize_shortlong(product.get('shortlong')) == "L" else "SHORT",
+                currency=product.get('currency', 'EUR'),
+                exchange_id=str(product.get('exchangeId', '')),
+                current_price=current_price,
+                tradable=product.get('tradable', False),
+                expiration_date=product.get('expirationDate'),
+                issuer=extract_issuer(product.get('name', '')),
+                price_source=price_source
+            )
+            leveraged_products.append(leveraged_product)
         
         return LeveragedSearchResponse(
             query={
@@ -1554,7 +1774,7 @@ async def search_products(
             detail="Query parameter 'q' is required"
         )
     
-    api = get_trading_api()
+    api = get_fresh_trading_api()
     
     # Search for underlying stock (unless specific underlying_id provided)
     stock_product = None
@@ -1657,7 +1877,7 @@ async def check_order(
     - **time_type**: DAY or GTC
     """
     
-    api = get_trading_api()
+    api = get_fresh_trading_api()
     
     try:
         # Create DEGIRO order
@@ -1716,7 +1936,7 @@ async def place_order(
     2. Confirms and places the order
     """
     
-    api = get_trading_api()
+    api = get_fresh_trading_api()
     
     try:
         # Create DEGIRO order
@@ -1869,16 +2089,15 @@ async def get_nasdaq_batch_volume(
     """
     
     # Use existing trading API session
-    api = get_trading_api()
+    api = get_fresh_trading_api()
     
     # Load NASDAQ mapping
     nasdaq_mapping = load_nasdaq_mapping()
     
-    import pytz
     from concurrent.futures import ThreadPoolExecutor, as_completed
     
     # Time calculations (same for all stocks)
-    et_now = datetime.now(pytz.timezone('US/Eastern'))
+    et_now = datetime.now(ZoneInfo('America/New_York'))
     market_open = et_now.replace(hour=9, minute=30, second=0, microsecond=0)
     
     if et_now < market_open:
@@ -1962,7 +2181,7 @@ async def get_price_current(
     Returns current price, OHLC data, volume, and VWAP calculations.
     """
     
-    api = get_trading_api()
+    api = get_fresh_trading_api()
     
     try:
         # Use stocks/search to find the symbol and get current price
@@ -1978,18 +2197,32 @@ async def get_price_current(
         stock_product = stock_products[0]
         product_id = str(stock_product.get('id', ''))
         
-        # Get real price using existing batch function
-        real_prices = get_real_prices_batch([product_id])
-        
-        if product_id not in real_prices:
-            raise HTTPException(
-                status_code=503,
-                detail=f"No real-time price data available for {symbol}"
-            )
-        
-        price_info = real_prices[product_id]
+        # Get real price using existing batch function. Quotecast can return an
+        # empty first tick for a fresh session, so retry briefly before falling
+        # back to a recently fetched search price from the same product id.
+        import time as _time
+
+        real_prices = {}
+        for attempt in range(3):
+            real_prices = get_real_prices_batch([product_id])
+            if product_id in real_prices:
+                break
+            if attempt < 2:
+                _time.sleep(1)
+
+        if product_id in real_prices:
+            price_info = real_prices[product_id]
+        else:
+            cached_price = price_cache.get(product_id)
+            if not cached_price:
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"No real-time price data available for {symbol}"
+                )
+            price_info = cached_price["price"]
+
         current_price = price_info.last or price_info.bid or price_info.ask
-        
+
         if current_price is None:
             raise HTTPException(
                 status_code=503,
@@ -2025,8 +2258,7 @@ async def get_price_current(
         vwap = (high_price + low_price + current_price) / 3  # Simplified VWAP
         
         # Time calculations
-        import pytz
-        et_now = datetime.now(pytz.timezone('US/Eastern'))
+        et_now = datetime.now(ZoneInfo('America/New_York'))
         market_open = et_now.replace(hour=9, minute=30, second=0, microsecond=0)
         
         if et_now < market_open:
@@ -2054,56 +2286,50 @@ async def get_price_current(
         )
 
 
-@app.get("/api/health")
+@app.get('/api/health')
 async def health_check(
     api_key: str = Depends(verify_api_key_header_only),
-    deep: bool = Query(default=False, description="If true, performs a real DEGIRO API call to verify the session"),
+    deep: bool = Query(default=False, description='If true, performs a real DEGIRO API call to verify the session'),
 ):
-    """Extended health check with DEGIRO connection status - requires authentication"""
-    degiro_status = "unknown"
+    # Extended health check with DEGIRO connection status.
+    degiro_status = 'unknown'
     trading_ok: Optional[bool] = None
     trading_error: Optional[str] = None
 
     try:
         api = get_trading_api()
-        degiro_status = "connected" if api else "disconnected"
+        degiro_status = 'connected' if api else 'disconnected'
 
         if deep and api:
             try:
-                # Cheap ping that requires a valid trading session.
-                req = StocksRequest(
-                    search_text="AAPL",
-                    offset=0,
-                    limit=1,
-                    require_total=False,
-                    sort_columns="name",
-                    sort_types="asc",
-                )
-                res = api.product_search(req, raw=True)
-                products = (res or {}).get("products") if isinstance(res, dict) else None
-                trading_ok = bool(products)
+                trading_ok = ping_trading_api(api)
                 if not trading_ok:
-                    trading_error = "product_search returned no products"
+                    trading_error = 'product_search returned no products'
+                    degiro_status = 'session_invalid'
+                    reset_trading_api()
             except Exception as e:
                 trading_ok = False
                 trading_error = str(e)[:200]
+                if is_session_expired(str(e)):
+                    degiro_status = 'session_invalid'
+                    reset_trading_api()
 
     except Exception as e:
-        degiro_status = "connection_failed"
+        degiro_status = 'connection_failed'
         if deep:
             trading_ok = False
             trading_error = str(e)[:200]
 
     if deep and trading_ok is False:
-        degiro_status = "session_invalid"
+        degiro_status = 'session_invalid'
 
     return {
-        "status": "healthy",
-        "degiro_connection": degiro_status,
-        "degiro_trading_ok": trading_ok,
-        "degiro_trading_error": trading_error,
-        "api_version": "2.0.0",
-        "timestamp": datetime.now().isoformat(),
+        'status': 'healthy',
+        'degiro_connection': degiro_status,
+        'degiro_trading_ok': trading_ok,
+        'degiro_trading_error': trading_error,
+        'api_version': '2.0.0',
+        'timestamp': datetime.now().isoformat(),
     }
 
 if __name__ == "__main__":
