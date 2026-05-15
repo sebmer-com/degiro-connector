@@ -103,6 +103,24 @@ Universal search for stocks and leveraged products.
 }
 ```
 
+### Leveraged Screening Without Faktor or Optionsscheine
+
+For screens such as "4-6x LONG, exclude Faktor Long and Optionsscheine", use the two-step workflow and an additional name/basis-price filter:
+
+1. Resolve the stock first with `POST /api/stocks/search`; prefer exact ISIN matches, then exact ticker matches.
+2. Search DEGIRO leveraged products by the selected stock `product_id` as `underlying_product_id`.
+3. Reject product names containing `Faktor`, `Factor`, `Optionsschein`, `Warrant`, or `Discount`. Also reject classic option names such as `Call STR` / `Put STR` unless the name clearly contains turbo/mini/unlimited wording.
+4. Keep knockout-style products with names containing `Turbo`, `Mini`, `Unlimited`, `Open-End`, `BEST`, or `X-Unlimited`.
+5. Do not rely only on the DEGIRO `leverage` field for non-factor products; it is often empty for turbo, mini, and unlimited products.
+6. Calculate approximate LONG leverage from the live underlying price and the product basis price:
+
+```text
+basis_price = BP if present, otherwise STR, otherwise BAR
+approx_long_leverage = underlying_price / (underlying_price - basis_price)
+```
+
+Keep products where `4.0 <= approx_long_leverage <= 6.0`. This is discovery output only; always re-check bid/ask, barrier/stop loss, and `/api/orders/check` before placing an order.
+
 ### ✅ Order Validation
 
 **`POST /api/orders/check`**

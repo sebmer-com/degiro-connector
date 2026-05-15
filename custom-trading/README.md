@@ -8,7 +8,7 @@ Production-ready FastAPI server for automated DEGIRO trading with 5-endpoint API
 - **Stock Disambiguation**: Returns ALL matching stocks for precise selection
 - **Leveraged Product Discovery**: Dynamic search using specific stock IDs as underlying assets
 - **Advanced Filtering**: Leverage range, direction (LONG/SHORT), issuer, product subtype controls
-- **Product Type Filtering**: Distinguish between Optionsscheine, Knockouts, and Faktor certificates
+- **Product Type Filtering**: Distinguish between Optionsscheine, Knockouts, and unlimited/factor-style products
 - **Real-time Pricing**: Live bid/ask/last prices using DEGIRO's quotecast API
 - **Order Management**: Two-step validation (check → confirm) for safety
 - **Security**: Bearer token authentication with secure credential management
@@ -119,6 +119,28 @@ curl -H "Authorization: Bearer YOUR_API_KEY" \
 - If you get "503: Unable to fetch product metadata" errors, the API needs restart
 - Leveraged search depends on active DEGIRO session
 
+### Agent Workflow: Exclude Faktor and Optionsscheine
+
+Use this workflow when screening for 4-6x long products while excluding `Faktor` certificates and classic Optionsscheine:
+
+1. Call `POST /api/stocks/search` with the ticker or ISIN.
+2. Select the exact underlying by ISIN first, then by exact ticker symbol. For alternate listings, prefer the underlying ID that returns leveraged products. Example: `3IW` may need the Invesco `IVZ` underlying rather than the German 3IW listing.
+3. Fetch DEGIRO leveraged products with `LeveragedsRequest` using:
+   - `underlying_product_id=<stock product_id>`
+   - `shortlong="1"` for LONG or `"0"` for SHORT
+   - `popular_only=False`, `require_total=True`, pagination by `offset`
+4. Exclude products whose name contains `Faktor`, `Factor`, `Optionsschein`, `Warrant`, `Discount`, or plain classic option patterns such as `Call STR` / `Put STR` without turbo/mini/unlimited wording.
+5. Keep knockout-style names such as `Turbo`, `Mini`, `Unlimited`, `Open-End`, `BEST`, and `X-Unlimited`.
+6. Do not rely only on DEGIRO's `leverage` field for non-factor products. Turbo, Mini, and Unlimited products often return `leverage=None` in product search.
+7. For non-factor products, calculate approximate leverage from the live underlying price and the basis/strike/barrier parsed from the product name:
+
+```text
+approx_long_leverage = underlying_price / (underlying_price - basis_price)
+basis_price = BP if present, otherwise STR, otherwise BAR
+```
+
+For a 4-6x LONG search, keep products where `4.0 <= approx_long_leverage <= 6.0`. Always re-check bid/ask, stop loss, barrier, and order validity before placing an order.
+
 ### Step 1: Stock Search
 ```http
 POST /api/stocks/search
@@ -192,7 +214,9 @@ Content-Type: application/json
   - `"ALL"`: All leveraged products
   - `"CALL_PUT"`: **Optionsscheine** - Traditional call/put options with strike price
   - `"MINI"`: **Knockouts** - Mini long/short products with stop loss
-  - `"UNLIMITED"`: **Faktor** - Unlimited long/short factor certificates
+  - `"UNLIMITED"`: Unlimited long/short products by name
+
+Note: `product_subtype` is a name-based convenience filter. It is not enough for the "exclude Faktor and Optionsscheine, everything else is ok" workflow because many turbo/open-end products have no native `leverage` value in DEGIRO search results. Use the agent workflow above when exact non-factor 4-6x screening matters.
 
 **Response:**
 ```json
@@ -543,7 +567,7 @@ Added `product_subtype` parameter to leverage search endpoints to distinguish be
   - `"ALL"`: All leveraged products  
   - `"CALL_PUT"`: **Optionsscheine** - Traditional call/put options with strike price
   - `"MINI"`: **Knockouts** - Mini long/short products with stop loss  
-  - `"UNLIMITED"`: **Faktor** - Unlimited long/short factor certificates
+  - `"UNLIMITED"`: Unlimited long/short products by name
 
 **Example Usage:**
 ```json
