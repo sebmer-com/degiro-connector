@@ -404,6 +404,7 @@ def is_session_expired(error_message: str) -> bool:
     return any([
         '401' in error_lower,
         'unauthorized' in error_lower,
+        'connection has probably expired' in error_lower,
         'session' in error_lower and ('expired' in error_lower or 'invalid' in error_lower),
         'login' in error_lower,
         'authentication' in error_lower,
