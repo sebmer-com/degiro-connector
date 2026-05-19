@@ -127,7 +127,8 @@ Use this workflow when screening for 4-6x long products while excluding `Faktor`
 2. Select the exact underlying by ISIN first, then by exact ticker symbol. For alternate listings, prefer the underlying ID that returns leveraged products. Example: `3IW` may need the Invesco `IVZ` underlying rather than the German 3IW listing.
 3. Fetch DEGIRO leveraged products with one `LeveragedsRequest` using the web query-parameter path:
    - `product_type=560`
-   - `search_text=<underlying symbol or name>` (for example `apple`)
+   - `underlying_product_id=<stored degiro_id>` as the primary deterministic filter
+   - `search_text=<underlying symbol or name>` only as fallback if the ID query returns no products
    - `sub_product_type=14`
    - `instrument_type_id=11`
    - `min_leverage=<requested min>` and `max_leverage=<requested max>`

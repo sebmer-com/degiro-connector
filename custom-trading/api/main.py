@@ -583,8 +583,9 @@ def leveraged_search_terms(stock_product: Optional[Dict], fallback: str = "") ->
 
 
 def build_leveraged_ko_query_request(
-    search_text: str,
+    search_text: str | None = None,
     *,
+    underlying_product_id: int | None = None,
     action: str,
     min_leverage: float,
     max_leverage: float,
@@ -593,6 +594,7 @@ def build_leveraged_ko_query_request(
     """Build the DEGIRO web-style KO/turbo query without offset pagination."""
     return LeveragedsRequest(
         search_text=search_text,
+        underlying_product_id=underlying_product_id,
         limit=max(1, limit),
         require_total=True,
         product_type=LEVERAGED_WEB_PRODUCT_TYPE,
@@ -604,19 +606,45 @@ def build_leveraged_ko_query_request(
     )
 
 
+def _dedupe_products(products: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    products_by_id: dict[str, Dict[str, Any]] = {}
+    for product in products:
+        product_id = str(product.get("id") or "")
+        key = product_id or f"{product.get('isin', '')}:{product.get('name', '')}"
+        if key and key not in products_by_id:
+            products_by_id[key] = product
+    return list(products_by_id.values())
+
+
 def fetch_leveraged_products_by_query(
     api: TradingAPI,
     search_terms: List[str],
     *,
+    underlying_product_id: int | None = None,
     action: str,
     min_leverage: float,
     max_leverage: float,
     limit: int,
 ) -> List[Dict[str, Any]]:
-    """Fetch leveraged products with web query params, retrying alternate names without offsets."""
-    products_by_id: dict[str, Dict[str, Any]] = {}
+    """Fetch KO/turbo products by stored underlying ID first, then text fallbacks."""
     query_limit = max(limit, 100)
 
+    if underlying_product_id:
+        leveraged_request = build_leveraged_ko_query_request(
+            underlying_product_id=int(underlying_product_id),
+            action=action,
+            min_leverage=min_leverage,
+            max_leverage=max_leverage,
+            limit=query_limit,
+        )
+        search_results = api.product_search(leveraged_request, raw=True)
+        products = (search_results or {}).get("products") if isinstance(search_results, dict) else []
+        products = products or []
+        print(f"DEBUG: Underlying-id leveraged search '{underlying_product_id}' returned {len(products)} products")
+        if products:
+            return _dedupe_products(products)
+
+    all_products: List[Dict[str, Any]] = []
     for search_text in search_terms:
         leveraged_request = build_leveraged_ko_query_request(
             search_text,
@@ -631,13 +659,9 @@ def fetch_leveraged_products_by_query(
 
         products = search_results.get("products") or []
         print(f"DEBUG: Query-param leveraged search '{search_text}' returned {len(products)} products")
-        for product in products:
-            product_id = str(product.get("id") or "")
-            key = product_id or f"{product.get('isin', '')}:{product.get('name', '')}"
-            if key and key not in products_by_id:
-                products_by_id[key] = product
+        all_products.extend(products)
 
-    return list(products_by_id.values())
+    return _dedupe_products(all_products)
 
 
 def search_leveraged_products_dynamic(api: TradingAPI, stock_product: Optional[Dict], request: ProductSearchRequest) -> List[Dict]:
@@ -665,6 +689,7 @@ def search_leveraged_products_dynamic(api: TradingAPI, stock_product: Optional[D
         products = fetch_leveraged_products_by_query(
             api,
             leveraged_search_terms(stock_product, request.q),
+            underlying_product_id=underlying_id,
             action=request.action,
             min_leverage=request.min_leverage,
             max_leverage=request.max_leverage,
@@ -1661,6 +1686,7 @@ async def search_leveraged_products(
         all_products = fetch_leveraged_products_by_query(
             api,
             search_terms,
+            underlying_product_id=underlying_id_int,
             action=request.action,
             min_leverage=request.min_leverage,
             max_leverage=request.max_leverage,

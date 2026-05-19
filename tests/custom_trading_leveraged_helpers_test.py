@@ -95,7 +95,30 @@ def test_leveraged_search_terms_adds_clean_company_name_for_web_query() -> None:
     ]
 
 
-def test_build_leveraged_ko_query_request_uses_web_params_without_offset() -> None:
+def test_build_leveraged_ko_query_request_uses_underlying_id_without_offset() -> None:
+    main = load_api_main()
+
+    request = main.build_leveraged_ko_query_request(
+        underlying_product_id=1140400,
+        action="LONG",
+        min_leverage=4.0,
+        max_leverage=6.0,
+        limit=50,
+    )
+    params = request.model_dump(by_alias=True, exclude_none=True, mode="json")
+
+    assert params["productType"] == 560
+    assert params["underlyingProductId"] == 1140400
+    assert params["subProductType"] == 14
+    assert params["instrumentTypeId"] == 11
+    assert params["minLeverage"] == 4.0
+    assert params["maxLeverage"] == 6.0
+    assert params["shortlong"] == "1"
+    assert "offset" not in params
+    assert "searchText" not in params
+
+
+def test_build_leveraged_ko_query_request_keeps_search_text_fallback_without_offset() -> None:
     main = load_api_main()
 
     request = main.build_leveraged_ko_query_request(
@@ -118,7 +141,7 @@ def test_build_leveraged_ko_query_request_uses_web_params_without_offset() -> No
     assert "underlyingProductId" not in params
 
 
-def test_dynamic_leveraged_search_uses_single_query_param_request(monkeypatch) -> None:
+def test_dynamic_leveraged_search_uses_underlying_id_first(monkeypatch) -> None:
     main = load_api_main()
 
     class FakeAPI:
@@ -155,11 +178,59 @@ def test_dynamic_leveraged_search_uses_single_query_param_request(monkeypatch) -
 
     assert len(products) == 1
     assert len(api.requests) == 1
-    assert params["searchText"] == "apple"
+    assert params["underlyingProductId"] == 123
     assert params["productType"] == 560
     assert params["subProductType"] == 14
     assert params["instrumentTypeId"] == 11
     assert params["minLeverage"] == 4.0
     assert params["maxLeverage"] == 6.0
     assert "offset" not in params
-    assert "underlyingProductId" not in params
+    assert "searchText" not in params
+
+
+def test_dynamic_leveraged_search_falls_back_to_text_only_when_underlying_id_returns_empty(monkeypatch) -> None:
+    main = load_api_main()
+
+    class FakeAPI:
+        def __init__(self) -> None:
+            self.requests = []
+
+        def product_search(self, product_request, raw=False):
+            self.requests.append(product_request)
+            params = product_request.model_dump(by_alias=True, exclude_none=True, mode="json")
+            if "underlyingProductId" in params:
+                return {"products": []}
+            return {
+                "products": [
+                    {
+                        "id": "abc",
+                        "name": "Apple Turbo BEST Open-End Call 5.1",
+                        "leverage": 5.0,
+                        "shortlong": "L",
+                        "tradable": True,
+                    }
+                ]
+            }
+
+    monkeypatch.setattr(main, "get_real_prices_batch", lambda _ids: {})
+    api = FakeAPI()
+    request = main.ProductSearchRequest(
+        q="apple",
+        underlying_id=123,
+        action="LONG",
+        min_leverage=4.0,
+        max_leverage=6.0,
+        limit=10,
+    )
+
+    products = main.search_leveraged_products_dynamic(api, None, request)
+    first_params = api.requests[0].model_dump(by_alias=True, exclude_none=True, mode="json")
+    second_params = api.requests[1].model_dump(by_alias=True, exclude_none=True, mode="json")
+
+    assert len(products) == 1
+    assert first_params["underlyingProductId"] == 123
+    assert "searchText" not in first_params
+    assert second_params["searchText"] == "apple"
+    assert "underlyingProductId" not in second_params
+    assert "offset" not in first_params
+    assert "offset" not in second_params
