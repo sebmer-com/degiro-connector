@@ -141,6 +141,33 @@ def test_build_leveraged_ko_query_request_keeps_search_text_fallback_without_off
     assert "underlyingProductId" not in params
 
 
+def test_rank_and_limit_leveraged_products_keeps_highest_after_broad_filtering() -> None:
+    main = load_api_main()
+    products = [
+        {"id": "low-1", "_effective_leverage": 1.9},
+        {"id": "low-2", "_effective_leverage": 2.1},
+        {"id": "ifx-5x", "_effective_leverage": 5.0},
+        {"id": "mid", "_effective_leverage": 3.2},
+    ]
+
+    ranked = main.rank_and_limit_leveraged_products(products, 2)
+
+    assert [product["id"] for product in ranked] == ["ifx-5x", "mid"]
+
+
+def test_rank_and_limit_leveraged_products_clamps_invalid_limit() -> None:
+    main = load_api_main()
+    products = [
+        {"id": "low", "_effective_leverage": 1.9},
+        {"id": "high", "_effective_leverage": 5.0},
+    ]
+
+    ranked = main.rank_and_limit_leveraged_products(products, -10)
+
+    assert [product["id"] for product in ranked] == ["high"]
+
+
+
 def test_dynamic_leveraged_search_uses_underlying_id_first(monkeypatch) -> None:
     main = load_api_main()
 

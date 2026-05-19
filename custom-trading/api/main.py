@@ -664,6 +664,16 @@ def fetch_leveraged_products_by_query(
     return _dedupe_products(all_products)
 
 
+def rank_and_limit_leveraged_products(products: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
+    """Return highest effective leverage products after broad filtering."""
+    safe_limit = max(1, int(limit))
+    return sorted(
+        products,
+        key=lambda product: float(product.get("_effective_leverage") or product.get("leverage") or 0),
+        reverse=True,
+    )[:safe_limit]
+
+
 def search_leveraged_products_dynamic(api: TradingAPI, stock_product: Optional[Dict], request: ProductSearchRequest) -> List[Dict]:
     """Dynamic leveraged products search - uses stock product ID as underlying ID"""
     try:
@@ -1737,8 +1747,6 @@ async def search_leveraged_products(
                     if len(filtered) <= 3:
                         print(f"DEBUG: Added product {len(filtered)}: {product.get('name')}, leverage={leverage}, ID={product.get('id')}")
 
-                if len(filtered) >= request.limit:
-                    break
             return filtered
 
         leveraged_products_data = filter_leveraged_products(all_products) if all_products else []
@@ -1748,6 +1756,8 @@ async def search_leveraged_products(
         # Filter by product subtype if specified
         if hasattr(request, 'product_subtype') and str(request.product_subtype or "ALL").strip().upper() != "ALL":
             leveraged_products_data = filter_by_product_subtype(leveraged_products_data, request.product_subtype)
+
+        leveraged_products_data = rank_and_limit_leveraged_products(leveraged_products_data, request.limit)
         
         # Get underlying stock info for response
         # We need to search for it since we only have the ID
