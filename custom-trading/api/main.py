@@ -587,8 +587,8 @@ def build_leveraged_ko_query_request(
     *,
     underlying_product_id: int | None = None,
     action: str,
-    min_leverage: float,
-    max_leverage: float,
+    min_leverage: float | None,
+    max_leverage: float | None,
     limit: int,
 ) -> LeveragedsRequest:
     """Build the DEGIRO web-style KO/turbo query without offset pagination."""
@@ -600,8 +600,8 @@ def build_leveraged_ko_query_request(
         product_type=LEVERAGED_WEB_PRODUCT_TYPE,
         sub_product_type=LEVERAGED_KO_SUB_PRODUCT_TYPE,
         instrument_type_id=LEVERAGED_KO_INSTRUMENT_TYPE_ID,
-        min_leverage=min_leverage,
-        max_leverage=max_leverage,
+        min_leverage=None if underlying_product_id is not None else min_leverage,
+        max_leverage=None if underlying_product_id is not None else max_leverage,
         shortlong=leveraged_direction_query_value(action),
     )
 
@@ -627,14 +627,14 @@ def fetch_leveraged_products_by_query(
     limit: int,
 ) -> List[Dict[str, Any]]:
     """Fetch KO/turbo products by stored underlying ID first, then text fallbacks."""
-    query_limit = max(limit, 100)
+    query_limit = max(limit, 500)
 
     if underlying_product_id:
         leveraged_request = build_leveraged_ko_query_request(
             underlying_product_id=int(underlying_product_id),
             action=action,
-            min_leverage=min_leverage,
-            max_leverage=max_leverage,
+            min_leverage=None,
+            max_leverage=None,
             limit=query_limit,
         )
         search_results = api.product_search(leveraged_request, raw=True)

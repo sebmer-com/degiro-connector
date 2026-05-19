@@ -111,9 +111,9 @@ def test_build_leveraged_ko_query_request_uses_underlying_id_without_offset() ->
     assert params["underlyingProductId"] == 1140400
     assert params["subProductType"] == 14
     assert params["instrumentTypeId"] == 11
-    assert params["minLeverage"] == 4.0
-    assert params["maxLeverage"] == 6.0
     assert params["shortlong"] == "1"
+    assert "minLeverage" not in params
+    assert "maxLeverage" not in params
     assert "offset" not in params
     assert "searchText" not in params
 
@@ -182,8 +182,8 @@ def test_dynamic_leveraged_search_uses_underlying_id_first(monkeypatch) -> None:
     assert params["productType"] == 560
     assert params["subProductType"] == 14
     assert params["instrumentTypeId"] == 11
-    assert params["minLeverage"] == 4.0
-    assert params["maxLeverage"] == 6.0
+    assert "minLeverage" not in params
+    assert "maxLeverage" not in params
     assert "offset" not in params
     assert "searchText" not in params
 

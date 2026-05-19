@@ -131,7 +131,7 @@ Use this workflow when screening for 4-6x long products while excluding `Faktor`
    - `search_text=<underlying symbol or name>` only as fallback if the ID query returns no products
    - `sub_product_type=14`
    - `instrument_type_id=11`
-   - `min_leverage=<requested min>` and `max_leverage=<requested max>`
+   - `min_leverage=<requested min>` and `max_leverage=<requested max>` on text fallback requests; ID requests fetch broadly and filter computed leverage locally
    - `shortlong="1"` for LONG or `"0"` for SHORT
    - no `offset` pagination
 4. Exclude products whose name contains `Faktor`, `Factor`, `Optionsschein`, `Warrant`, `Discount`, or plain classic option patterns such as `Call STR` / `Put STR` without turbo/mini/unlimited wording.
