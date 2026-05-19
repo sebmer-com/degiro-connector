@@ -143,8 +143,8 @@ class ProductSearchRequest(BaseModel):
     limit: int = Field(default=50, description="Max leveraged products to return")
     
     # Enhanced leveraged product parameters
-    product_type: Optional[int] = Field(default=None, description="Product type (14=leveraged)")
-    sub_product_type: Optional[int] = Field(default=None, description="Sub product type (14=leveraged)")
+    product_type: Optional[int] = Field(default=None, description="Product type (560=leveraged web search)")
+    sub_product_type: Optional[int] = Field(default=None, description="Sub product type (14=KO/turbo leveraged)")
     short_long: Optional[int] = Field(default=None, description="Direction filter (-1=all, 1=LONG, 0=SHORT)")
     issuer_id: Optional[int] = Field(default=None, description="Issuer filter (-1=all)")
     underlying_id: Optional[int] = Field(default=None, description="Underlying stock product ID")
@@ -155,6 +155,11 @@ class ProductSearchResponse(BaseModel):
     leveraged_products: List[LeveragedProduct]
     total_found: Dict[str, int]
     timestamp: str
+
+
+LEVERAGED_WEB_PRODUCT_TYPE = 560
+LEVERAGED_KO_SUB_PRODUCT_TYPE = 14
+LEVERAGED_KO_INSTRUMENT_TYPE_ID = 11
 
 # Order Models
 class OrderRequest(BaseModel):
@@ -535,6 +540,106 @@ def search_stock_universal(api: TradingAPI, query: str) -> Optional[Dict]:
         print(f"Universal stock search failed: {e}")
         return None
 
+
+def leveraged_direction_query_value(action: str) -> str:
+    """DEGIRO web search uses 1 for LONG and 0 for SHORT."""
+    return "1" if str(action).upper() == "LONG" else "0"
+
+
+def leveraged_search_terms(stock_product: Optional[Dict], fallback: str = "") -> List[str]:
+    """Return stable searchText candidates for the DEGIRO web leveraged query."""
+    candidates: List[str] = []
+    if stock_product:
+        for key in ("symbol", "name"):
+            value = str(stock_product.get(key) or "").strip()
+            if value:
+                candidates.append(value)
+                # DEGIRO's web leveraged search finds Apple products for
+                # searchText=apple, but not for AAPL or Apple Inc. Add a cleaned
+                # company-name term before falling back to the raw query.
+                if key == "name":
+                    cleaned = re.sub(
+                        r"\b(?:inc|inc\.|corp|corp\.|corporation|nv|n\.v\.|sa|s\.a\.|plc|ag|se|ltd|ltd\.|class\s+[a-z])\b",
+                        "",
+                        value,
+                        flags=re.IGNORECASE,
+                    )
+                    cleaned = re.sub(r"[^A-Za-z0-9]+", " ", cleaned).strip()
+                    if cleaned and cleaned != value:
+                        candidates.append(cleaned)
+    fallback = str(fallback or "").strip()
+    if fallback:
+        candidates.append(fallback)
+
+    seen: set[str] = set()
+    unique_terms: List[str] = []
+    for candidate in candidates:
+        normalized = candidate.lower()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        unique_terms.append(candidate)
+    return unique_terms
+
+
+def build_leveraged_ko_query_request(
+    search_text: str,
+    *,
+    action: str,
+    min_leverage: float,
+    max_leverage: float,
+    limit: int,
+) -> LeveragedsRequest:
+    """Build the DEGIRO web-style KO/turbo query without offset pagination."""
+    return LeveragedsRequest(
+        search_text=search_text,
+        limit=max(1, limit),
+        require_total=True,
+        product_type=LEVERAGED_WEB_PRODUCT_TYPE,
+        sub_product_type=LEVERAGED_KO_SUB_PRODUCT_TYPE,
+        instrument_type_id=LEVERAGED_KO_INSTRUMENT_TYPE_ID,
+        min_leverage=min_leverage,
+        max_leverage=max_leverage,
+        shortlong=leveraged_direction_query_value(action),
+    )
+
+
+def fetch_leveraged_products_by_query(
+    api: TradingAPI,
+    search_terms: List[str],
+    *,
+    action: str,
+    min_leverage: float,
+    max_leverage: float,
+    limit: int,
+) -> List[Dict[str, Any]]:
+    """Fetch leveraged products with web query params, retrying alternate names without offsets."""
+    products_by_id: dict[str, Dict[str, Any]] = {}
+    query_limit = max(limit, 100)
+
+    for search_text in search_terms:
+        leveraged_request = build_leveraged_ko_query_request(
+            search_text,
+            action=action,
+            min_leverage=min_leverage,
+            max_leverage=max_leverage,
+            limit=query_limit,
+        )
+        search_results = api.product_search(leveraged_request, raw=True)
+        if not isinstance(search_results, dict) or "products" not in search_results:
+            continue
+
+        products = search_results.get("products") or []
+        print(f"DEBUG: Query-param leveraged search '{search_text}' returned {len(products)} products")
+        for product in products:
+            product_id = str(product.get("id") or "")
+            key = product_id or f"{product.get('isin', '')}:{product.get('name', '')}"
+            if key and key not in products_by_id:
+                products_by_id[key] = product
+
+    return list(products_by_id.values())
+
+
 def search_leveraged_products_dynamic(api: TradingAPI, stock_product: Optional[Dict], request: ProductSearchRequest) -> List[Dict]:
     """Dynamic leveraged products search - uses stock product ID as underlying ID"""
     try:
@@ -549,45 +654,42 @@ def search_leveraged_products_dynamic(api: TradingAPI, stock_product: Optional[D
         if not underlying_id:
             return []
         
-        # RESTORED: Complete LeveragedsRequest from working commit 513b531
-        leveraged_request = LeveragedsRequest(
-            popular_only=False,
-            input_aggregate_types="",
-            input_aggregate_values="",
-            search_text=request.q,
-            offset=0,
-            limit=100,
-            require_total=True,
-            sort_columns="leverage",
-            sort_types="asc"
+        underlying_prices = get_real_prices_batch([str(underlying_id)])
+        underlying_price = price_info_value(underlying_prices.get(str(underlying_id)))
+        if underlying_price is None and stock_product:
+            fallback_underlying_price, _ = product_fallback_price(stock_product)
+            underlying_price = price_info_value(fallback_underlying_price)
+
+        suitable_products = []
+        seen_ids: set[str] = set()
+        products = fetch_leveraged_products_by_query(
+            api,
+            leveraged_search_terms(stock_product, request.q),
+            action=request.action,
+            min_leverage=request.min_leverage,
+            max_leverage=request.max_leverage,
+            limit=request.limit,
         )
-        
-        search_results = api.product_search(leveraged_request, raw=True)
-        
-        if isinstance(search_results, dict) and 'products' in search_results:
-            products = search_results['products']
-            
-            suitable_products = []
-            target_direction = "L" if request.action.upper() == "LONG" else "S"
-            
-            for product in products:
-                # Use DEGIRO fields for reliable filtering
-                leverage = product.get('leverage', 0)
-                shortlong = product.get('shortlong')
-                tradable = product.get('tradable', False)
-                
-                # Filter by leverage range, direction, and tradability
-                if (request.min_leverage <= leverage <= request.max_leverage and 
-                    shortlong == target_direction and 
-                    tradable):
-                    suitable_products.append(product)
-                
-                if len(suitable_products) >= request.limit:
-                    break
-            
-            return suitable_products
-        
-        return []
+
+        for product in products:
+            product_id = str(product.get('id') or '')
+            if product_id and product_id in seen_ids:
+                continue
+            if product_id:
+                seen_ids.add(product_id)
+            leverage = approximate_long_leverage(product, underlying_price)
+            if leverage is None:
+                continue
+
+            if (request.min_leverage <= leverage <= request.max_leverage and
+                is_supported_knockout_product(product, action=request.action)):
+                product["_effective_leverage"] = leverage
+                suitable_products.append(product)
+
+            if len(suitable_products) >= request.limit:
+                break
+
+        return suitable_products
         
     except Exception as e:
         return []
@@ -595,42 +697,32 @@ def search_leveraged_products_dynamic(api: TradingAPI, stock_product: Optional[D
 def search_leveraged_products(api: TradingAPI, search_term: str, action: str, min_leverage: float, max_leverage: float, limit: int) -> List[Dict]:
     """Search for leveraged products"""
     try:
-        leveraged_request = LeveragedsRequest(
-            popular_only=False,
-            input_aggregate_types="",
-            input_aggregate_values="",
-            search_text=search_term,
-            offset=0,
-            limit=100,
-            require_total=True,
-            sort_columns="leverage",
-            sort_types="asc"
+        products = fetch_leveraged_products_by_query(
+            api,
+            [search_term],
+            action=action,
+            min_leverage=min_leverage,
+            max_leverage=max_leverage,
+            limit=limit,
         )
-        
-        search_results = api.product_search(leveraged_request, raw=True)
-        
-        if isinstance(search_results, dict) and 'products' in search_results:
-            products = search_results['products']
-            
-            suitable_products = []
-            target_direction = "L" if action.upper() == "LONG" else "S"
-            
-            for product in products:
-                leverage = product.get('leverage', 0)
-                shortlong = product.get('shortlong')
-                tradable = product.get('tradable', False)
-                
-                if (min_leverage <= leverage <= max_leverage and 
-                    shortlong == target_direction and 
-                    tradable):
-                    suitable_products.append(product)
-                    
-                    if len(suitable_products) >= limit:
-                        break
-            
-            return suitable_products
-        
-        return []
+
+        suitable_products = []
+        target_direction = "L" if action.upper() == "LONG" else "S"
+
+        for product in products:
+            leverage = _positive_float(product.get('leverage')) or 0.0
+            shortlong = normalize_shortlong(product.get('shortlong'))
+            tradable = product.get('tradable', False)
+
+            if (min_leverage <= leverage <= max_leverage and
+                shortlong == target_direction and
+                tradable):
+                suitable_products.append(product)
+
+                if len(suitable_products) >= limit:
+                    break
+
+        return suitable_products
         
     except Exception as e:
         print(f"Leveraged search failed: {e}")
@@ -1184,8 +1276,12 @@ def filter_by_product_subtype(products: list, subtype: str) -> list:
 
 
 LONG_KNOCKOUT_NAME_RE = re.compile(r"\b(?:LONG|CALL)\b", re.IGNORECASE)
-KO_STYLE_NAME_RE = re.compile(r"\b(?:TURBO|MINI|KNOCK[- ]?OUT|OPEN[- ]?END|UNLIMITED|FAKTOR|FACTOR|BEST)\b", re.IGNORECASE)
-REJECTED_LEVERAGED_NAME_RE = re.compile(r"\b(?:SHORT|PUT|OPTIONSSCHEIN(?:E)?|OPTIONS?SCHEIN(?:E)?)\b", re.IGNORECASE)
+KO_STYLE_NAME_RE = re.compile(r"\b(?:TURBO|MINI|KNOCK[- ]?OUT|OPEN[- ]?END|UNLIMITED|BEST)\b", re.IGNORECASE)
+REJECTED_LEVERAGED_NAME_RE = re.compile(
+    r"\b(?:SHORT|PUT|FAKTOR|FACTOR|WARRANT|DISCOUNT|OPTIONSSCHEIN(?:E)?|OPTIONS?SCHEIN(?:E)?)\b",
+    re.IGNORECASE,
+)
+KNOCKOUT_BASIS_RE = re.compile(r"\b(?:BP|STR|BAR)\s+([0-9]+(?:[.,][0-9]+)?)\b", re.IGNORECASE)
 
 
 def is_supported_knockout_product(product: Dict[str, Any], *, action: str) -> bool:
@@ -1204,6 +1300,42 @@ def is_supported_knockout_product(product: Dict[str, Any], *, action: str) -> bo
     if str(action).upper() == "LONG" and not LONG_KNOCKOUT_NAME_RE.search(name):
         return False
     return bool(KO_STYLE_NAME_RE.search(name))
+
+
+def knockout_basis_price(product: Dict[str, Any]) -> Optional[float]:
+    """Extract BP/STR/BAR basis from DEGIRO KO product names."""
+    name = str(product.get("name") or "")
+    matches = KNOCKOUT_BASIS_RE.findall(name)
+    if not matches:
+        return None
+    # Prefer BP when present, then STR, then BAR. The regex scans in name order,
+    # and SG turbo names usually include BAR before BP, so choose explicitly.
+    for label in ("BP", "STR", "BAR"):
+        match = re.search(rf"\b{label}\s+([0-9]+(?:[.,][0-9]+)?)\b", name, re.IGNORECASE)
+        if match:
+            return _positive_float(match.group(1))
+    return _positive_float(matches[0])
+
+
+def approximate_long_leverage(product: Dict[str, Any], underlying_price: Optional[float]) -> Optional[float]:
+    native = _positive_float(product.get("leverage"))
+    if native is not None:
+        return native
+    if underlying_price is None or underlying_price <= 0:
+        return None
+    basis = knockout_basis_price(product)
+    if basis is None or basis <= 0 or basis >= underlying_price:
+        return None
+    return float(underlying_price) / (float(underlying_price) - basis)
+
+
+def price_info_value(price: Any) -> Optional[float]:
+    for field in ("ask", "last", "bid"):
+        value = getattr(price, field, None)
+        parsed = _positive_float(value)
+        if parsed is not None:
+            return parsed
+    return None
 
 
 def normalize_shortlong(value: Any) -> str:
@@ -1503,61 +1635,39 @@ async def search_leveraged_products(
         search_term = underlying_stock_info.get('symbol', underlying_stock_info.get('name', ''))
         print(f"DEBUG: Using search term '{search_term}' for leveraged products")
 
-    # Create enhanced leveraged request with shortlong parameter
-    # DEGIRO uses numeric values: 0=SHORT, 1=LONG (from web interface URLs)
-    shortlong_value = "1" if request.action.upper() == "LONG" else "0"
+    # DEGIRO web search uses numeric values: 0=SHORT, 1=LONG.
+    shortlong_value = leveraged_direction_query_value(request.action)
 
     print(f"DEBUG: Set shortlong={shortlong_value} for action={request.action}")
 
-    # Fetch ALL leveraged products using pagination
+    search_terms = leveraged_search_terms(underlying_stock_info)
+    print(f"DEBUG: Leveraged query search terms: {search_terms}")
+
+    # Fetch leveraged products using DEGIRO's web query params, without offset pagination.
     all_products = []
-    offset = 0
-    batch_size = 100  # Fetch 100 products per request
-    total_products = None
+
+    # Fetch a live underlying price before filtering. Turbo/Mini/Unlimited
+    # products often have no native DEGIRO leverage field, so we calculate an
+    # approximate LONG leverage from the product basis price.
+    underlying_prices_for_filter = get_real_prices_batch([str(request.underlying_id)])
+    underlying_price_for_filter = price_info_value(underlying_prices_for_filter.get(str(request.underlying_id)))
+    if underlying_price_for_filter is None and underlying_stock_info:
+        fallback_underlying_price, fallback_source = product_fallback_price(underlying_stock_info)
+        underlying_price_for_filter = price_info_value(fallback_underlying_price)
+        if underlying_price_for_filter is not None:
+            print(f"DEBUG: Using underlying metadata price from {fallback_source}: {underlying_price_for_filter}")
 
     try:
-        while True:
-            leveraged_request = LeveragedsRequest(
-                popular_only=False,
-                input_aggregate_types="",
-                input_aggregate_values="",
-                search_text="",  # Empty when using underlying_product_id
-                offset=offset,
-                limit=batch_size,
-                require_total=True,
-                sort_columns="leverage",
-                sort_types="asc",
-                underlying_product_id=underlying_id_int,
-                shortlong=shortlong_value  # 0=SHORT, 1=LONG
-            )
+        all_products = fetch_leveraged_products_by_query(
+            api,
+            search_terms,
+            action=request.action,
+            min_leverage=request.min_leverage,
+            max_leverage=request.max_leverage,
+            limit=request.limit,
+        )
 
-            search_results = api.product_search(leveraged_request, raw=True)
-
-            # Debug: print raw response
-            if offset == 0:
-                print(f"DEBUG: DEGIRO product_search response type: {type(search_results)}")
-                if isinstance(search_results, dict):
-                    print(f"DEBUG: Response keys: {list(search_results.keys())}")
-                    total_products = search_results.get('total', 0)
-                    print(f"DEBUG: Total products available: {total_products}")
-
-            if isinstance(search_results, dict) and 'products' in search_results:
-                products = search_results['products']
-                if not products:
-                    break  # No more products
-
-                all_products.extend(products)
-                print(f"DEBUG: Fetched batch at offset {offset}: {len(products)} products (total so far: {len(all_products)})")
-
-                offset += batch_size
-
-                # Stop if we've fetched all available products
-                if total_products and len(all_products) >= total_products:
-                    break
-            else:
-                break
-
-        print(f"DEBUG: Fetched {len(all_products)} total products from DEGIRO")
+        print(f"DEBUG: Fetched {len(all_products)} products from DEGIRO query-param search")
 
         def filter_leveraged_products(products: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             filtered: List[Dict[str, Any]] = []
@@ -1586,12 +1696,17 @@ async def search_leveraged_products(
                     print(f"  {i}. {p.get('name')[:50]}, leverage={lev}, tradable={p.get('tradable')}")
 
             for product in products:
-                # Use DEGIRO's native fields (more reliable than name parsing)
-                leverage = _positive_float(product.get('leverage')) or 0.0
+                # Use DEGIRO's native leverage when available. Many KO/turbo
+                # products expose only BAR/BP/STR in the name, so estimate LONG
+                # leverage from the current underlying price and basis.
+                leverage = approximate_long_leverage(product, underlying_price_for_filter)
+                if leverage is None:
+                    continue
 
                 # Filter by leverage range, direction, tradability, and KO-style product names.
                 if (request.min_leverage <= leverage <= request.max_leverage and
                     is_supported_knockout_product(product, action=request.action)):
+                    product["_effective_leverage"] = leverage
                     filtered.append(product)
                     if len(filtered) <= 3:
                         print(f"DEBUG: Added product {len(filtered)}: {product.get('name')}, leverage={leverage}, ID={product.get('id')}")
@@ -1601,46 +1716,6 @@ async def search_leveraged_products(
             return filtered
 
         leveraged_products_data = filter_leveraged_products(all_products) if all_products else []
-
-        if not leveraged_products_data and search_term:
-            print(f"DEBUG: No eligible products by underlying_id; retrying leveraged search with text '{search_term}'")
-            fallback_products: List[Dict[str, Any]] = []
-            seen_product_ids = {str(product.get("id")) for product in all_products if product.get("id")}
-            offset = 0
-            total_products = None
-            while True:
-                leveraged_request = LeveragedsRequest(
-                    popular_only=False,
-                    input_aggregate_types="",
-                    input_aggregate_values="",
-                    search_text=search_term,
-                    offset=offset,
-                    limit=batch_size,
-                    require_total=True,
-                    sort_columns="leverage",
-                    sort_types="asc",
-                    shortlong=shortlong_value
-                )
-                search_results = api.product_search(leveraged_request, raw=True)
-                if offset == 0 and isinstance(search_results, dict):
-                    total_products = search_results.get('total', 0)
-                    print(f"DEBUG: Text fallback total products available: {total_products}")
-                if not isinstance(search_results, dict) or 'products' not in search_results:
-                    break
-                products = search_results['products']
-                if not products:
-                    break
-                for product in products:
-                    product_id = str(product.get("id") or "")
-                    if product_id and product_id in seen_product_ids:
-                        continue
-                    if product_id:
-                        seen_product_ids.add(product_id)
-                    fallback_products.append(product)
-                offset += batch_size
-                if total_products and offset >= total_products:
-                    break
-            leveraged_products_data = filter_leveraged_products(fallback_products)
 
         print(f"DEBUG: After filtering: {len(leveraged_products_data)} products (min_lev={request.min_leverage}, max_lev={request.max_leverage})")
         
@@ -1716,11 +1791,12 @@ async def search_leveraged_products(
             if price_source != "quotecast":
                 price_cache[product_id] = {"price": current_price, "timestamp": datetime.now().isoformat()}
 
+            effective_leverage = _positive_float(product.get("_effective_leverage")) or _positive_float(product.get('leverage')) or 0.0
             leveraged_product = LeveragedProduct(
                 product_id=product_id,
                 name=product.get('name', ''),
                 isin=product.get('isin', ''),
-                leverage=product.get('leverage', 0.0),
+                leverage=effective_leverage,
                 direction="LONG" if normalize_shortlong(product.get('shortlong')) == "L" else "SHORT",
                 currency=product.get('currency', 'EUR'),
                 exchange_id=str(product.get('exchangeId', '')),
@@ -1821,27 +1897,35 @@ async def search_products(
     leveraged_product_ids = [str(product.get('id', '')) for product in leveraged_products_data if product.get('id')]
     leveraged_real_prices = get_real_prices_batch(leveraged_product_ids)
     
-    # Convert to response format, excluding products without pricing data
+    # Convert to response format. Realtime quotecast can be empty outside
+    # market/session windows; fall back to product-search metadata just like the
+    # dedicated /api/leveraged/search endpoint.
     leveraged_products = []
     for product in leveraged_products_data:
         product_id = str(product.get('id', ''))
-        
-        # Only include products that have real pricing data
-        if product_id in leveraged_real_prices:
-            leveraged_product = LeveragedProduct(
-                product_id=product_id,
-                name=product.get('name', ''),
-                isin=product.get('isin', ''),
-                leverage=product.get('leverage', 0.0),
-                direction="LONG" if product.get('shortlong') == "L" else "SHORT",
-                currency=product.get('currency', 'EUR'),
-                exchange_id=str(product.get('exchangeId', '')),
-                current_price=leveraged_real_prices[product_id],
-                tradable=product.get('tradable', False),
-                expiration_date=product.get('expirationDate'),
-                issuer=extract_issuer(product.get('name', ''))
-            )
-            leveraged_products.append(leveraged_product)
+        current_price = leveraged_real_prices.get(product_id)
+        price_source = "quotecast"
+        if current_price is None:
+            current_price, price_source = product_fallback_price(product)
+        if current_price.last is None and current_price.bid is None and current_price.ask is None:
+            continue
+
+        effective_leverage = _positive_float(product.get("_effective_leverage")) or _positive_float(product.get('leverage')) or 0.0
+        leveraged_product = LeveragedProduct(
+            product_id=product_id,
+            name=product.get('name', ''),
+            isin=product.get('isin', ''),
+            leverage=effective_leverage,
+            direction="LONG" if normalize_shortlong(product.get('shortlong')) == "L" else "SHORT",
+            currency=product.get('currency', 'EUR'),
+            exchange_id=str(product.get('exchangeId', '')),
+            current_price=current_price,
+            tradable=product.get('tradable', False),
+            expiration_date=product.get('expirationDate'),
+            issuer=extract_issuer(product.get('name', '')),
+            price_source=price_source,
+        )
+        leveraged_products.append(leveraged_product)
     
     return ProductSearchResponse(
         query={

@@ -61,17 +61,22 @@ class FuturesRequest(ProductInfo):
 
 
 class LeveragedsRequest(ProductInfo):
-    popular_only: bool
-    input_aggregate_types: str
-    input_aggregate_values: str
-    search_text: str
-    offset: int
-    limit: int
-    require_total: bool
-    sort_columns: str
-    sort_types: str
+    popular_only: bool | None = Field(default=None)
+    input_aggregate_types: str | None = Field(default=None)
+    input_aggregate_values: str | None = Field(default=None)
+    search_text: str | None = Field(default=None)
+    offset: int | None = Field(default=None)
+    limit: int | None = Field(default=None)
+    require_total: bool | None = Field(default=None)
+    sort_columns: str | None = Field(default=None)
+    sort_types: str | None = Field(default=None)
     underlying_product_id: int | None = Field(default=None)
     shortlong: str | None = Field(default=None)
+    product_type: int | None = Field(default=None)
+    sub_product_type: int | None = Field(default=None)
+    instrument_type_id: int | None = Field(default=None)
+    min_leverage: float | None = Field(default=None)
+    max_leverage: float | None = Field(default=None)
 
 
 class LookupRequest(ProductInfo):

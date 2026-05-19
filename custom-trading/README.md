@@ -125,10 +125,14 @@ Use this workflow when screening for 4-6x long products while excluding `Faktor`
 
 1. Call `POST /api/stocks/search` with the ticker or ISIN.
 2. Select the exact underlying by ISIN first, then by exact ticker symbol. For alternate listings, prefer the underlying ID that returns leveraged products. Example: `3IW` may need the Invesco `IVZ` underlying rather than the German 3IW listing.
-3. Fetch DEGIRO leveraged products with `LeveragedsRequest` using:
-   - `underlying_product_id=<stock product_id>`
+3. Fetch DEGIRO leveraged products with one `LeveragedsRequest` using the web query-parameter path:
+   - `product_type=560`
+   - `search_text=<underlying symbol or name>` (for example `apple`)
+   - `sub_product_type=14`
+   - `instrument_type_id=11`
+   - `min_leverage=<requested min>` and `max_leverage=<requested max>`
    - `shortlong="1"` for LONG or `"0"` for SHORT
-   - `popular_only=False`, `require_total=True`, pagination by `offset`
+   - no `offset` pagination
 4. Exclude products whose name contains `Faktor`, `Factor`, `Optionsschein`, `Warrant`, `Discount`, or plain classic option patterns such as `Call STR` / `Put STR` without turbo/mini/unlimited wording.
 5. Keep knockout-style names such as `Turbo`, `Mini`, `Unlimited`, `Open-End`, `BEST`, and `X-Unlimited`.
 6. Do not rely only on DEGIRO's `leverage` field for non-factor products. Turbo, Mini, and Unlimited products often return `leverage=None` in product search.

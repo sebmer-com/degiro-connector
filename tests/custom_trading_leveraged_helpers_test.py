@@ -35,7 +35,7 @@ def test_all_subtype_does_not_filter_products() -> None:
 def test_supported_knockout_filter_keeps_long_turbo_and_rejects_put_short_optionsschein() -> None:
     main = load_api_main()
 
-    assert main.is_supported_knockout_product(
+    assert not main.is_supported_knockout_product(
         {"name": "SG Apple Faktor Long HB 4", "shortlong": 1, "tradable": True},
         action="LONG",
     )
@@ -66,7 +66,6 @@ def test_product_fallback_price_uses_search_metadata_when_realtime_is_missing() 
     assert source == "closePrice"
 
 
-
 def test_product_fallback_price_uses_nested_quote_metadata() -> None:
     main = load_api_main()
 
@@ -84,3 +83,83 @@ def test_normalize_shortlong_handles_degiro_variants() -> None:
     assert main.normalize_shortlong("LONG") == "L"
     assert main.normalize_shortlong(0) == "S"
     assert main.normalize_shortlong("SHORT") == "S"
+
+
+def test_leveraged_search_terms_adds_clean_company_name_for_web_query() -> None:
+    main = load_api_main()
+
+    assert main.leveraged_search_terms({"symbol": "AAPL", "name": "Apple Inc"}) == [
+        "AAPL",
+        "Apple Inc",
+        "Apple",
+    ]
+
+
+def test_build_leveraged_ko_query_request_uses_web_params_without_offset() -> None:
+    main = load_api_main()
+
+    request = main.build_leveraged_ko_query_request(
+        "apple",
+        action="LONG",
+        min_leverage=4.0,
+        max_leverage=6.0,
+        limit=50,
+    )
+    params = request.model_dump(by_alias=True, exclude_none=True, mode="json")
+
+    assert params["productType"] == 560
+    assert params["searchText"] == "apple"
+    assert params["subProductType"] == 14
+    assert params["instrumentTypeId"] == 11
+    assert params["minLeverage"] == 4.0
+    assert params["maxLeverage"] == 6.0
+    assert params["shortlong"] == "1"
+    assert "offset" not in params
+    assert "underlyingProductId" not in params
+
+
+def test_dynamic_leveraged_search_uses_single_query_param_request(monkeypatch) -> None:
+    main = load_api_main()
+
+    class FakeAPI:
+        def __init__(self) -> None:
+            self.requests = []
+
+        def product_search(self, product_request, raw=False):
+            self.requests.append(product_request)
+            return {
+                "products": [
+                    {
+                        "id": "abc",
+                        "name": "Apple Turbo BEST Open-End Call 5.1",
+                        "leverage": 5.0,
+                        "shortlong": "L",
+                        "tradable": True,
+                    }
+                ]
+            }
+
+    monkeypatch.setattr(main, "get_real_prices_batch", lambda _ids: {})
+    api = FakeAPI()
+    request = main.ProductSearchRequest(
+        q="apple",
+        underlying_id=123,
+        action="LONG",
+        min_leverage=4.0,
+        max_leverage=6.0,
+        limit=10,
+    )
+
+    products = main.search_leveraged_products_dynamic(api, None, request)
+    params = api.requests[0].model_dump(by_alias=True, exclude_none=True, mode="json")
+
+    assert len(products) == 1
+    assert len(api.requests) == 1
+    assert params["searchText"] == "apple"
+    assert params["productType"] == 560
+    assert params["subProductType"] == 14
+    assert params["instrumentTypeId"] == 11
+    assert params["minLeverage"] == 4.0
+    assert params["maxLeverage"] == 6.0
+    assert "offset" not in params
+    assert "underlyingProductId" not in params

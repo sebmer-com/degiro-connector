@@ -816,7 +816,7 @@
               }
             ],
             "title": "Product Type",
-            "description": "Product type (14=leveraged)"
+            "description": "Product type (560=leveraged web search)"
           },
           "sub_product_type": {
             "anyOf": [
@@ -828,7 +828,7 @@
               }
             ],
             "title": "Sub Product Type",
-            "description": "Sub product type (14=leveraged)"
+            "description": "Sub product type (14=KO/turbo leveraged)"
           },
           "short_long": {
             "anyOf": [
