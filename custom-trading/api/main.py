@@ -418,6 +418,136 @@ def reconnect_trading_api():
     trading_api = None  # Reset global
     return get_trading_api()  # This will create new connection
 
+
+DEGIRO_ERROR_TEXT_KEYS = ("text", "message", "detail", "description", "reason", "error", "error_description")
+DEGIRO_ERROR_CODE_KEYS = ("status", "statusCode", "status_code", "code", "errorCode", "error_code")
+SENSITIVE_ERROR_KEY_PARTS = (
+    "authorization",
+    "cookie",
+    "jsessionid",
+    "password",
+    "secret",
+    "session_id",
+    "sessionid",
+    "token",
+)
+SENSITIVE_ERROR_PATTERNS = (
+    re.compile(r"(?i)(jsessionid=)[^;&\s]+"),
+    re.compile(r"(?i)(sessionId=)[^&\s]+"),
+    re.compile(r"(?i)((?:session|session_id)=)[^&;\s]+"),
+    re.compile(r"(?i)(authorization:\s*bearer\s+)[^\s]+"),
+    re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._\-]+"),
+    re.compile(r"(?i)((?:password|secret|token|cookie)=)[^&\s]+"),
+)
+
+
+def is_sensitive_error_key(key: Any) -> bool:
+    normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
+    return any(part.replace("_", "") in normalized for part in SENSITIVE_ERROR_KEY_PARTS)
+
+
+def sanitize_degiro_error_text(value: Any) -> str:
+    text = str(value)
+    for pattern in SENSITIVE_ERROR_PATTERNS:
+        text = pattern.sub(r"\1<redacted>", text)
+    return text[:1000]
+
+
+def format_degiro_code_key(key: str) -> str:
+    normalized = key.lower().replace("_", "")
+    if normalized in {"status", "statuscode"}:
+        return "status"
+    return "code"
+
+
+def degiro_error_code_parts(raw_error: Any) -> List[str]:
+    if not isinstance(raw_error, dict):
+        return []
+
+    code_parts = []
+    for key in DEGIRO_ERROR_CODE_KEYS:
+        if key not in raw_error or is_sensitive_error_key(key):
+            continue
+
+        value = raw_error.get(key)
+        if value in (None, "") or isinstance(value, (dict, list)):
+            continue
+
+        safe_value = sanitize_degiro_error_text(value)
+        if safe_value:
+            code_parts.append(f"{format_degiro_code_key(key)}: {safe_value}")
+
+    return list(dict.fromkeys(code_parts))
+
+
+def append_degiro_error_codes(message: str, code_parts: List[str]) -> str:
+    if not code_parts:
+        return message
+    return f"{message} ({', '.join(code_parts)})"
+
+
+def extract_degiro_error_messages(raw_error: Any, inherited_codes: Optional[List[str]] = None) -> List[str]:
+    inherited_codes = inherited_codes or []
+    messages: List[str] = []
+
+    if isinstance(raw_error, dict):
+        current_codes = list(dict.fromkeys(inherited_codes + degiro_error_code_parts(raw_error)))
+
+        raw_errors = raw_error.get("errors")
+        if isinstance(raw_errors, list):
+            for item in raw_errors:
+                messages.extend(extract_degiro_error_messages(item, current_codes))
+        elif raw_errors is not None:
+            messages.extend(extract_degiro_error_messages(raw_errors, current_codes))
+
+        for key in DEGIRO_ERROR_TEXT_KEYS:
+            if key not in raw_error or is_sensitive_error_key(key):
+                continue
+
+            value = raw_error.get(key)
+            if isinstance(value, (dict, list)):
+                messages.extend(extract_degiro_error_messages(value, current_codes))
+                continue
+
+            if value not in (None, ""):
+                message = sanitize_degiro_error_text(value)
+                if message:
+                    messages.append(append_degiro_error_codes(message, current_codes))
+
+    elif isinstance(raw_error, list):
+        for item in raw_error:
+            messages.extend(extract_degiro_error_messages(item, inherited_codes))
+    elif raw_error not in (None, ""):
+        message = sanitize_degiro_error_text(raw_error)
+        if message:
+            messages.append(append_degiro_error_codes(message, inherited_codes))
+
+    return list(dict.fromkeys(messages))
+
+
+def degiro_failure_details(raw_error: Any, fallback_message: str) -> tuple[str, List[str]]:
+    errors = extract_degiro_error_messages(raw_error)
+    if not errors:
+        errors = [fallback_message]
+
+    first_error = errors[0]
+    if first_error == fallback_message:
+        return fallback_message, errors
+    return f"{fallback_message}: {first_error}", errors
+
+
+def retry_raw_degiro_order_call(api: TradingAPI, operation) -> Any:
+    try:
+        return operation(api)
+    except Exception as e:
+        if is_session_expired(str(e)) or "connection required" in str(e).lower():
+            try:
+                reconnected_api = reconnect_trading_api()
+                return operation(reconnected_api)
+            except Exception as reconnect_error:
+                return {"message": str(reconnect_error)}
+        return {"message": str(e)}
+
 def extract_leverage_from_name(product_name: str) -> Optional[float]:
     """Extract leverage value from product name"""
     import re
@@ -2025,10 +2155,15 @@ async def check_order(
                 message="Order validation successful"
             )
         else:
+            raw_error = retry_raw_degiro_order_call(
+                api,
+                lambda raw_api: raw_api.check_order(order=order, raw=True),
+            )
+            message, errors = degiro_failure_details(raw_error, "Order validation failed")
             return OrderCheckResponse(
                 valid=False,
-                message="Order validation failed",
-                errors=["Unknown validation error"]
+                message=message,
+                errors=errors
             )
             
     except ValueError as e:
@@ -2074,9 +2209,14 @@ async def place_order(
                 raise
         
         if not checking_response or not hasattr(checking_response, 'confirmation_id'):
+            raw_error = retry_raw_degiro_order_call(
+                api,
+                lambda raw_api: raw_api.check_order(order=order, raw=True),
+            )
+            message, _ = degiro_failure_details(raw_error, "Order validation failed")
             return OrderResponse(
                 success=False,
-                message="Order validation failed",
+                message=message,
                 product_id=request.product_id,
                 action=request.action,
                 order_type=request.order_type,
@@ -2118,9 +2258,18 @@ async def place_order(
                 created_at=datetime.now().isoformat()
             )
         else:
+            raw_error = retry_raw_degiro_order_call(
+                api,
+                lambda raw_api: raw_api.confirm_order(
+                    confirmation_id=checking_response.confirmation_id,
+                    order=order,
+                    raw=True,
+                ),
+            )
+            message, _ = degiro_failure_details(raw_error, "Order confirmation failed")
             return OrderResponse(
                 success=False,
-                message="Order confirmation failed",
+                message=message,
                 product_id=request.product_id,
                 action=request.action,
                 order_type=request.order_type,

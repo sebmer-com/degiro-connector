@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import json
 import os
@@ -165,6 +166,133 @@ def test_rank_and_limit_leveraged_products_clamps_invalid_limit() -> None:
     ranked = main.rank_and_limit_leveraged_products(products, -10)
 
     assert [product["id"] for product in ranked] == ["high"]
+
+
+def test_order_check_surfaces_raw_rate_limit_error(monkeypatch) -> None:
+    main = load_api_main()
+    order = object()
+
+    class FakeAPI:
+        def __init__(self) -> None:
+            self.check_calls = []
+
+        def check_order(self, order, raw=False):
+            self.check_calls.append(raw)
+            if raw:
+                return {
+                    "errors": [
+                        {
+                            "text": "Rate limit for the given request exceeded sessionId=secret-session",
+                            "status": 429,
+                        }
+                    ]
+                }
+            return None
+
+    api = FakeAPI()
+    monkeypatch.setattr(main, "create_degiro_order", lambda _request: order)
+    monkeypatch.setattr(main, "get_fresh_trading_api", lambda: api)
+    request = main.OrderRequest(
+        product_id="123",
+        action="BUY",
+        order_type="MARKET",
+        quantity=1,
+    )
+
+    response = asyncio.run(main.check_order(request, api_key="test-key"))
+
+    assert response.valid is False
+    assert api.check_calls == [False, True]
+    assert "Rate limit for the given request exceeded" in response.message
+    assert "status: 429" in response.errors[0]
+    assert "secret-session" not in response.message
+    assert "secret-session" not in response.errors[0]
+
+
+def test_order_place_surfaces_raw_confirmation_rate_limit_error(monkeypatch) -> None:
+    main = load_api_main()
+    order = object()
+
+    class CheckingResponse:
+        confirmation_id = "confirmation-123"
+        transaction_fee = 0.12
+
+    class FakeAPI:
+        def __init__(self) -> None:
+            self.check_calls = []
+            self.confirm_calls = []
+
+        def check_order(self, order, raw=False):
+            self.check_calls.append(raw)
+            return CheckingResponse()
+
+        def confirm_order(self, confirmation_id, order, raw=False):
+            self.confirm_calls.append((confirmation_id, raw))
+            if raw:
+                return {
+                    "errors": [
+                        {
+                            "text": "Rate limit for the given request exceeded",
+                            "code": 429,
+                        }
+                    ]
+                }
+            return None
+
+    api = FakeAPI()
+    monkeypatch.setattr(main, "create_degiro_order", lambda _request: order)
+    monkeypatch.setattr(main, "get_fresh_trading_api", lambda: api)
+    request = main.OrderRequest(
+        product_id="123",
+        action="BUY",
+        order_type="MARKET",
+        quantity=1,
+    )
+
+    response = asyncio.run(main.place_order(request, api_key="test-key"))
+
+    assert response.success is False
+    assert api.check_calls == [False]
+    assert api.confirm_calls == [("confirmation-123", False), ("confirmation-123", True)]
+    assert response.message == "Order confirmation failed: Rate limit for the given request exceeded (code: 429)"
+
+
+def test_order_place_surfaces_raw_validation_rate_limit_error(monkeypatch) -> None:
+    main = load_api_main()
+    order = object()
+
+    class FakeAPI:
+        def __init__(self) -> None:
+            self.check_calls = []
+
+        def check_order(self, order, raw=False):
+            self.check_calls.append(raw)
+            if raw:
+                return {
+                    "errors": [
+                        {
+                            "text": "Rate limit for the given request exceeded",
+                            "status": 429,
+                        }
+                    ]
+                }
+            return None
+
+    api = FakeAPI()
+    monkeypatch.setattr(main, "create_degiro_order", lambda _request: order)
+    monkeypatch.setattr(main, "get_fresh_trading_api", lambda: api)
+    request = main.OrderRequest(
+        product_id="123",
+        action="BUY",
+        order_type="MARKET",
+        quantity=1,
+    )
+
+    response = asyncio.run(main.place_order(request, api_key="test-key"))
+
+    assert response.success is False
+    assert api.check_calls == [False, True]
+    assert response.message == "Order validation failed: Rate limit for the given request exceeded (status: 429)"
 
 
 
