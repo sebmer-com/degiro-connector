@@ -209,6 +209,64 @@ def test_order_check_surfaces_raw_rate_limit_error(monkeypatch) -> None:
     assert "secret-session" not in response.errors[0]
 
 
+def test_degiro_session_expiry_detection_handles_raw_payloads_and_exceptions() -> None:
+    main = load_api_main()
+
+    assert main.is_degiro_session_expired(
+        {"errors": [{"text": "Unauthorized sessionId=secret-session", "status": 401}]}
+    )
+    assert main.is_degiro_session_expired([{"message": "Session expired"}])
+    assert main.is_degiro_session_expired(Exception("connection required: sessionId=secret-session"))
+    assert not main.is_degiro_session_expired(
+        {"errors": [{"text": "Rate limit for the given request exceeded", "status": 429}]}
+    )
+
+
+def test_order_check_reconnects_when_raw_check_reports_unauthorized(monkeypatch) -> None:
+    main = load_api_main()
+    order = object()
+
+    class FakeAPI:
+        def __init__(self, raw_response):
+            self.raw_response = raw_response
+            self.check_calls = []
+
+        def check_order(self, order, raw=False):
+            self.check_calls.append(raw)
+            if raw:
+                return self.raw_response
+            return None
+
+    expired_api = FakeAPI({"errors": [{"text": "Unauthorized sessionId=secret-session", "status": 401}]})
+    reconnected_api = FakeAPI(
+        {
+            "data": {
+                "confirmationId": "confirmation-456",
+                "transactionFee": 0.34,
+                "freeSpaceNew": 123.45,
+            }
+        }
+    )
+
+    monkeypatch.setattr(main, "create_degiro_order", lambda _request: order)
+    monkeypatch.setattr(main, "get_fresh_trading_api", lambda: expired_api)
+    monkeypatch.setattr(main, "reconnect_trading_api", lambda: reconnected_api)
+    request = main.OrderRequest(
+        product_id="123",
+        action="BUY",
+        order_type="MARKET",
+        quantity=1,
+    )
+
+    response = asyncio.run(main.check_order(request, api_key="test-key"))
+
+    assert response.valid is True
+    assert response.confirmation_id == "confirmation-456"
+    assert response.estimated_fee == 0.34
+    assert expired_api.check_calls == [False, True]
+    assert reconnected_api.check_calls == [True]
+
+
 def test_order_place_surfaces_raw_confirmation_rate_limit_error(monkeypatch) -> None:
     main = load_api_main()
     order = object()
@@ -293,6 +351,59 @@ def test_order_place_surfaces_raw_validation_rate_limit_error(monkeypatch) -> No
     assert response.success is False
     assert api.check_calls == [False, True]
     assert response.message == "Order validation failed: Rate limit for the given request exceeded (status: 429)"
+
+
+def test_order_place_uses_reconnected_api_after_raw_check_recovers(monkeypatch) -> None:
+    main = load_api_main()
+    order = object()
+
+    class ConfirmationResponse:
+        order_id = "order-789"
+
+    class FakeAPI:
+        def __init__(self, raw_response):
+            self.raw_response = raw_response
+            self.check_calls = []
+            self.confirm_calls = []
+
+        def check_order(self, order, raw=False):
+            self.check_calls.append(raw)
+            if raw:
+                return self.raw_response
+            return None
+
+        def confirm_order(self, confirmation_id, order, raw=False):
+            self.confirm_calls.append((confirmation_id, raw))
+            return ConfirmationResponse()
+
+    expired_api = FakeAPI({"errors": [{"text": "Unauthorized", "status": 401}]})
+    reconnected_api = FakeAPI({"data": {"confirmationId": "confirmation-789", "transactionFee": 0.12}})
+    current_api = {"api": expired_api}
+
+    def reconnect():
+        current_api["api"] = reconnected_api
+        return reconnected_api
+
+    monkeypatch.setattr(main, "create_degiro_order", lambda _request: order)
+    monkeypatch.setattr(main, "get_fresh_trading_api", lambda: expired_api)
+    monkeypatch.setattr(main, "reconnect_trading_api", reconnect)
+    monkeypatch.setattr(main, "get_trading_api", lambda force_reconnect=False: current_api["api"])
+    request = main.OrderRequest(
+        product_id="123",
+        action="BUY",
+        order_type="MARKET",
+        quantity=1,
+    )
+
+    response = asyncio.run(main.place_order(request, api_key="test-key"))
+
+    assert response.success is True
+    assert response.order_id == "order-789"
+    assert response.confirmation_id == "confirmation-789"
+    assert expired_api.check_calls == [False, True]
+    assert reconnected_api.check_calls == [True]
+    assert expired_api.confirm_calls == []
+    assert reconnected_api.confirm_calls == [("confirmation-789", False)]
 
 
 

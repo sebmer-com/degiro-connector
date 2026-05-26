@@ -22,7 +22,7 @@ from pydantic import BaseModel, Field
 from degiro_connector.trading.api import API as TradingAPI
 from degiro_connector.trading.models.credentials import Credentials
 from degiro_connector.trading.models.product_search import StocksRequest, LeveragedsRequest
-from degiro_connector.trading.models.order import Order
+from degiro_connector.trading.models.order import ConfirmationWrapper, CheckingWrapper, Order
 
 # Load environment variables
 # Load environment variables from .env if available
@@ -400,11 +400,17 @@ def is_session_expired(error_message: str) -> bool:
     - "session" in error message
     - "login" or "authentication" errors
     """
-    error_lower = str(error_message).lower()
+    return is_degiro_session_expired(error_message)
+
+
+def is_degiro_session_error_text(value: Any) -> bool:
+    error_lower = str(value).lower()
     return any([
         '401' in error_lower,
         'unauthorized' in error_lower,
+        'unauthorised' in error_lower,
         'connection has probably expired' in error_lower,
+        'connection required' in error_lower,
         'session' in error_lower and ('expired' in error_lower or 'invalid' in error_lower),
         'login' in error_lower,
         'authentication' in error_lower,
@@ -451,6 +457,38 @@ def sanitize_degiro_error_text(value: Any) -> str:
     for pattern in SENSITIVE_ERROR_PATTERNS:
         text = pattern.sub(r"\1<redacted>", text)
     return text[:1000]
+
+
+def degiro_error_code_is_unauthorized(value: Any) -> bool:
+    if isinstance(value, bool) or value in (None, ""):
+        return False
+    if isinstance(value, (int, float)):
+        return int(value) == 401
+    return re.search(r"\b401\b", str(value)) is not None
+
+
+def is_degiro_session_expired(raw_error: Any) -> bool:
+    """Detect expired/unauthorized DEGIRO sessions in exceptions or raw payloads."""
+    if isinstance(raw_error, BaseException):
+        return is_degiro_session_error_text(raw_error)
+
+    if isinstance(raw_error, dict):
+        for key, value in raw_error.items():
+            if key in DEGIRO_ERROR_CODE_KEYS and degiro_error_code_is_unauthorized(value):
+                return True
+            if isinstance(value, (dict, list)):
+                if is_degiro_session_expired(value):
+                    return True
+            elif not is_sensitive_error_key(key) and is_degiro_session_error_text(value):
+                return True
+        return False
+
+    if isinstance(raw_error, list):
+        return any(is_degiro_session_expired(item) for item in raw_error)
+
+    if raw_error in (None, ""):
+        return False
+    return is_degiro_session_error_text(raw_error)
 
 
 def format_degiro_code_key(key: str) -> str:
@@ -536,17 +574,59 @@ def degiro_failure_details(raw_error: Any, fallback_message: str) -> tuple[str, 
     return f"{fallback_message}: {first_error}", errors
 
 
+def parse_degiro_checking_response(raw_response: Any) -> Any:
+    if raw_response and hasattr(raw_response, 'confirmation_id'):
+        return raw_response
+    if not isinstance(raw_response, dict) or is_degiro_session_expired(raw_response):
+        return None
+    try:
+        return CheckingWrapper.model_validate(raw_response).data
+    except Exception:
+        return None
+
+
+def parse_degiro_confirmation_response(raw_response: Any) -> Any:
+    if raw_response and hasattr(raw_response, 'order_id'):
+        return raw_response
+    if not isinstance(raw_response, dict) or is_degiro_session_expired(raw_response):
+        return None
+    try:
+        return ConfirmationWrapper.model_validate(raw_response).data
+    except Exception:
+        return None
+
+
+def order_check_success_response(checking_response: Any) -> OrderCheckResponse:
+    return OrderCheckResponse(
+        valid=True,
+        confirmation_id=checking_response.confirmation_id,
+        estimated_fee=getattr(checking_response, 'transaction_fee', None),
+        total_cost=None,  # Calculate if needed
+        free_space_new=getattr(checking_response, 'free_space_new', None),
+        message="Order validation successful"
+    )
+
+
 def retry_raw_degiro_order_call(api: TradingAPI, operation) -> Any:
     try:
-        return operation(api)
+        raw_result = operation(api)
     except Exception as e:
-        if is_session_expired(str(e)) or "connection required" in str(e).lower():
+        if is_degiro_session_expired(e):
             try:
                 reconnected_api = reconnect_trading_api()
                 return operation(reconnected_api)
             except Exception as reconnect_error:
-                return {"message": str(reconnect_error)}
-        return {"message": str(e)}
+                return {"message": sanitize_degiro_error_text(reconnect_error)}
+        return {"message": sanitize_degiro_error_text(e)}
+
+    if is_degiro_session_expired(raw_result):
+        try:
+            reconnected_api = reconnect_trading_api()
+            return operation(reconnected_api)
+        except Exception as reconnect_error:
+            return {"message": sanitize_degiro_error_text(reconnect_error)}
+
+    return raw_result
 
 def extract_leverage_from_name(product_name: str) -> Optional[float]:
     """Extract leverage value from product name"""
@@ -2138,7 +2218,7 @@ async def check_order(
         try:
             checking_response = api.check_order(order=order)
         except Exception as e:
-            if is_session_expired(str(e)) or "connection required" in str(e).lower():
+            if is_degiro_session_expired(e):
                 api = reconnect_trading_api()
                 checking_response = api.check_order(order=order)
             else:
@@ -2146,19 +2226,16 @@ async def check_order(
         
         # Parse response
         if checking_response and hasattr(checking_response, 'confirmation_id'):
-            return OrderCheckResponse(
-                valid=True,
-                confirmation_id=checking_response.confirmation_id,
-                estimated_fee=getattr(checking_response, 'transaction_fee', None),
-                total_cost=None,  # Calculate if needed
-                free_space_new=getattr(checking_response, 'free_space_new', None),
-                message="Order validation successful"
-            )
+            return order_check_success_response(checking_response)
         else:
             raw_error = retry_raw_degiro_order_call(
                 api,
                 lambda raw_api: raw_api.check_order(order=order, raw=True),
             )
+            recovered_checking_response = parse_degiro_checking_response(raw_error)
+            if recovered_checking_response:
+                return order_check_success_response(recovered_checking_response)
+
             message, errors = degiro_failure_details(raw_error, "Order validation failed")
             return OrderCheckResponse(
                 valid=False,
@@ -2176,7 +2253,7 @@ async def check_order(
         return OrderCheckResponse(
             valid=False,
             message="Order validation failed",
-            errors=[f"DEGIRO error: {str(e)}"]
+            errors=[f"DEGIRO error: {sanitize_degiro_error_text(e)}"]
         )
 
 @app.post("/api/orders/place", response_model=OrderResponse)
@@ -2202,7 +2279,7 @@ async def place_order(
         try:
             checking_response = api.check_order(order=order)
         except Exception as e:
-            if is_session_expired(str(e)) or "connection required" in str(e).lower():
+            if is_degiro_session_expired(e):
                 api = reconnect_trading_api()
                 checking_response = api.check_order(order=order)
             else:
@@ -2213,18 +2290,23 @@ async def place_order(
                 api,
                 lambda raw_api: raw_api.check_order(order=order, raw=True),
             )
-            message, _ = degiro_failure_details(raw_error, "Order validation failed")
-            return OrderResponse(
-                success=False,
-                message=message,
-                product_id=request.product_id,
-                action=request.action,
-                order_type=request.order_type,
-                quantity=request.quantity,
-                price=request.price,
-                stop_price=request.stop_price,
-                created_at=datetime.now().isoformat()
-            )
+            recovered_checking_response = parse_degiro_checking_response(raw_error)
+            if recovered_checking_response:
+                checking_response = recovered_checking_response
+                api = get_trading_api()
+            else:
+                message, _ = degiro_failure_details(raw_error, "Order validation failed")
+                return OrderResponse(
+                    success=False,
+                    message=message,
+                    product_id=request.product_id,
+                    action=request.action,
+                    order_type=request.order_type,
+                    quantity=request.quantity,
+                    price=request.price,
+                    stop_price=request.stop_price,
+                    created_at=datetime.now().isoformat()
+                )
         
         # Step 2: Confirm order
         try:
@@ -2233,7 +2315,7 @@ async def place_order(
                 order=order
             )
         except Exception as e:
-            if is_session_expired(str(e)) or "connection required" in str(e).lower():
+            if is_degiro_session_expired(e):
                 api = reconnect_trading_api()
                 confirmation_response = api.confirm_order(
                     confirmation_id=checking_response.confirmation_id,
@@ -2266,6 +2348,23 @@ async def place_order(
                     raw=True,
                 ),
             )
+            recovered_confirmation_response = parse_degiro_confirmation_response(raw_error)
+            if recovered_confirmation_response:
+                return OrderResponse(
+                    success=True,
+                    order_id=recovered_confirmation_response.order_id,
+                    confirmation_id=checking_response.confirmation_id,
+                    message="Order placed successfully",
+                    product_id=request.product_id,
+                    action=request.action,
+                    order_type=request.order_type,
+                    quantity=request.quantity,
+                    price=request.price,
+                    stop_price=request.stop_price,
+                    estimated_fee=getattr(checking_response, 'transaction_fee', None),
+                    created_at=datetime.now().isoformat()
+                )
+
             message, _ = degiro_failure_details(raw_error, "Order confirmation failed")
             return OrderResponse(
                 success=False,
@@ -2294,7 +2393,7 @@ async def place_order(
     except Exception as e:
         return OrderResponse(
             success=False,
-            message=f"Order placement failed: {str(e)}",
+            message=f"Order placement failed: {sanitize_degiro_error_text(e)}",
             product_id=request.product_id,
             action=request.action,
             order_type=request.order_type,
